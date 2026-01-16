@@ -1,0 +1,513 @@
+#include <U8g2lib.h>
+#include <EEPROM.h>
+#include <ESP32Encoder.h> // Dodaj tę bibliotekę do managera bibliotek!
+#include "Globals.h"
+#include "MachineLogic.h"
+#include "Storage.h"
+
+// FAKTYCZNE DEFINICJE - REZERWACJA MIEJSCA W PAMIĘCI
+WorkState currentState = IDLE;
+MenuState currentMenu = STATUS_SCREEN;
+String currentAction = "IDLE";
+bool motorFinished = false;
+Config cfg;
+Config tempCfg;
+
+ESP32Encoder encoder;
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+long lastEnc = 0;
+int cursor = 0;
+bool editing = false;
+bool arming = false;
+unsigned long holdTimer = 0;
+int animFrame = 0;
+
+// --- FUNKCJE POMOCNICZE UI ---
+void drawEditLine(int idx, const char* label, float val, int y, bool isBool = false, bool isInt = false, const char* unit = "mm") {
+  if (cursor == idx) u8g2.drawStr(0, y, editing ? "#" : ">");
+  u8g2.setCursor(12, y); u8g2.print(label);
+  u8g2.setCursor(85, y); 
+  
+  if (isBool) {
+    u8g2.print(val > 0.5 ? "ON" : "OFF");
+  } 
+  else if (isInt) {
+    u8g2.print((int)val);
+    // Jeśli jednostka nie jest pusta, wypisz ją (np. dla "szt")
+    if (unit != nullptr && strlen(unit) > 0) {
+      u8g2.print(" "); 
+      u8g2.print(unit);
+    }
+  } 
+  else {
+    u8g2.print(val, 1); 
+    u8g2.print(unit); // Tutaj używamy przekazanej jednostki (domyślnie mm)
+  }
+}
+
+void forceSafeState(const char* powod) {
+    // 1. Fizyczne bezpieczeństwo
+    currentState = IDLE;
+    smciHardStop();  
+    sendSmciCommand("r0");                
+    digitalWrite(PIN_S3_EXTEND, LOW); 
+    isHomed = false; 
+    
+    // 2. Logika menu i czasu
+    currentAction = powod; 
+    currentMenu = EMERGENCY_STOP_SCREEN;
+    stateTimer = millis(); // START odliczania 5 sekund
+    
+    Serial.print("AWARYJNY STOP: "); Serial.println(powod);
+}
+
+void render() {
+  u8g2.clearBuffer();
+
+  // 1. NAJWYŻSZY PRIORYTET - Ekran błędu
+if (currentMenu == EMERGENCY_STOP_SCREEN) {
+    // Sprawdzamy czas: jeśli minęło 5s, wróć do statusu
+    if (millis() - stateTimer > 5000) {
+        currentMenu = STATUS_SCREEN;
+    } else {
+        // Rysowanie "Negatywu" dla alarmu (cały biały ekran)
+        u8g2.drawBox(0, 0, 128, 64);
+        u8g2.setDrawColor(0); // Czarny napis na białym tle
+        
+        u8g2.setFont(u8g2_font_helvB12_tr);
+        u8g2.drawStr(5, 25, "ZATRZYMANO!");
+        
+        u8g2.setFont(u8g2_font_6x12_tr);
+        u8g2.setCursor(10, 45);
+        u8g2.print(currentAction); // Tu wyświetli się powód błędu
+        
+        // Pasek postępu
+        long rem = 5000 - (millis() - stateTimer);
+        u8g2.drawFrame(10, 52, 108, 4);
+        u8g2.drawBox(10, 52, map(constrain(rem, 0, 5000), 0, 5000, 0, 108), 4);
+        
+        u8g2.setDrawColor(1); // Przywróć kolor dla reszty pętli
+        u8g2.sendBuffer();
+        return; // WAŻNE: Nie pozwól rysować niczego innego!
+    }
+  }
+
+
+  u8g2.setFont(u8g2_font_6x12_tr);
+
+  if (currentMenu == STATUS_SCREEN) {
+    u8g2.drawStr(20, 10, "-----STATUS----");
+
+    u8g2.setFont(u8g2_font_5x8_tr);
+    float off = calculateOffset(cfg);
+    u8g2.setCursor(0, 22); u8g2.print("Szer: "); u8g2.print(cfg.szerokosc, 1);
+    u8g2.setCursor(0, 31); u8g2.print("Odst: "); u8g2.print(cfg.odstep, 1);
+    u8g2.setCursor(0, 40); u8g2.print("Otw: "); u8g2.print(cfg.ilosc);
+    u8g2.setCursor(0, 49); u8g2.print("Offs: "); 
+    if(off <= 0) u8g2.print("BLAD!"); else u8g2.print(off, 2);
+    u8g2.setCursor(0, 58); u8g2.print("Done: "); u8g2.print(cfg.cycleCount);
+    u8g2.setCursor(60, 22); u8g2.print("| Auto: "); u8g2.print(cfg.autoMode ? "ON" : "OFF");
+    u8g2.setCursor(60, 31); u8g2.print("| Spd: "); u8g2.print(cfg.workSpeed);
+    u8g2.setCursor(60, 45); u8g2.print("Push to START");
+    
+    if (arming) {
+      unsigned long elapsed = millis() - holdTimer;
+      if (elapsed > ARM_START_DELAY) {
+        u8g2.drawFrame(63, 50, 55, 10); 
+        int barWidth = map(constrain(elapsed, ARM_START_DELAY, ARM_TOTAL_TIME), ARM_START_DELAY, ARM_TOTAL_TIME, 0, 51);
+        u8g2.drawBox(65, 52, barWidth, 6);
+      }
+    }
+  } 
+if (currentMenu == WORKING_ANIM) {
+    // 1. Obsługa błędów (bez zmian)
+    if (currentState == DRILL_ERROR) {
+      u8g2.drawStr(20, 20, "!!! ERROR !!!");
+      u8g2.drawStr(10, 40, "TIMEOUT WIERTARKI");
+    } 
+    else if (currentState == WAIT_FOR_RELOAD) {
+      u8g2.drawStr(15, 20, "BRAK CZESCI");
+      u8g2.drawStr(10, 45, "ZALADUJ I POTWIERDZ");
+    }
+    // 2. NOWA LOGIKA: Wyświetlanie statusu bazowania LUB pozycji
+    else {
+      u8g2.setFont(u8g2_font_7x14_tr);
+      u8g2.setCursor(5, 15);
+      u8g2.print(currentAction); // Wyświetla np. "HOMING FAST" lub "PUSHING..."
+      if ((currentAction) == "NEXT HOLE..."){
+        u8g2.setFont(u8g2_font_helvB12_tr);
+        u8g2.setCursor(5, 35);
+        u8g2.print(cfg.odstep);
+        u8g2.print(" mm");
+      }
+      if ((currentAction) == "FINISHING..."){
+        u8g2.setFont(u8g2_font_helvB12_tr);
+        u8g2.setCursor(5, 40);
+        u8g2.print(calculateOffset(cfg) * 2.0f);
+        u8g2.print(" mm");
+      }
+      
+
+      if (!isHomed) {
+        // Ekran podczas bazowania
+        u8g2.setFont(u8g2_font_6x12_tr);
+        u8g2.drawStr(10, 35, "Trwa bazowanie...");
+        u8g2.drawStr(10, 47, "Prosze czekac");
+      } 
+      else {
+        u8g2.setFont(u8g2_font_6x12_tr);
+        u8g2.setCursor(10, 52); 
+        u8g2.print("SZTUKA NR: ");
+        u8g2.setFont(u8g2_font_helvB12_tr);
+        u8g2.print(cfg.cycleCount);
+      }
+      
+      // Animacja paska (zawsze aktywna w ruchu)
+      u8g2.drawFrame(10, 58, 108, 4); 
+      u8g2.drawBox(12 + (animFrame % 90), 59, 15, 2);
+      animFrame++;
+    }
+  }
+
+  else if (currentMenu == MAIN_MENU) {
+    u8g2.drawStr(0, 12, "MENU:");
+    u8g2.drawStr(15, 25, cursor == 0 ? "> PROGRAM" : "  PROGRAM");
+    u8g2.drawStr(15, 37, cursor == 1 ? "> SETTINGS" : "  SETTINGS");
+    u8g2.drawStr(15, 49, cursor == 2 ? "> RESET" : "  RESET");
+    u8g2.drawStr(15, 61, cursor == 3 ? "> KALIBRACJA" : "  KALIBRACJA"); // Nowa linia
+  }
+  else if (currentMenu == CALIBRATION_MENU) {
+    u8g2.drawStr(0, 12, "KALIBRACJA:");
+    u8g2.drawStr(15, 28, cursor == 0 ? "> TEST CZUJNIKOW" : "  TEST CZUJNIKOW");
+    u8g2.drawStr(15, 42, cursor == 1 ? "> RUCH RECZNY" : "  RUCH RECZNY");
+    u8g2.drawStr(15, 56, cursor == 2 ? "> STATUS SMCI" : "  STATUS SMCI");
+  }
+  else if (currentMenu == PROG_MENU) {
+    u8g2.drawStr(0, 12, "PROG (CONFIRM-ZAPIS):");
+    drawEditLine(0, "Szerokosc", tempCfg.szerokosc, 30);
+    drawEditLine(1, "Odstep", tempCfg.odstep, 45);
+    drawEditLine(2, "Ilosc", (float)tempCfg.ilosc, 60, false, true , "szt");
+  }
+  else if (currentMenu == SETTINGS_MENU) {
+      u8g2.setFont(u8g2_font_6x10_tr);
+      u8g2.drawStr(0, 12, "SET (CONFIRM-ZAPIS):");
+      u8g2.drawHLine(0, 14, 128);
+      
+
+      const int itemsCount = 6;    // Ilość opcji (Auto, Speed, HOMING_SPEED, HOME_BACKOFF_DIST)
+      const int visibleRows = 3;   // Ile linii mieści się na ekranie
+      
+      // Obliczanie przewijania (scroll)
+      int offset = 0;
+      if (cursor >= visibleRows) {
+          offset = cursor - visibleRows + 1;
+      }
+
+      for (int i = 0; i < visibleRows; i++) {
+          int idx = offset + i; 
+          if (idx >= itemsCount) break;
+
+          // Dynamiczne obliczanie Y: start od 32px, każda kolejna linia +11px
+          int yPos = 32 + (i * 11); 
+
+          switch(idx) {
+              case 0: drawEditLine(0, "Auto", tempCfg.autoMode ? 1.0 : 0.0, yPos, true); break;
+              case 1: drawEditLine(1, "Speed", (float)tempCfg.workSpeed, yPos, false, true, "Hz"); break;
+              case 2: drawEditLine(2, "HOMING_SPD", (float)tempCfg.homeSpeed, yPos, false, true, "Hz"); break;
+              case 3: drawEditLine(3, "BACKOFF", tempCfg.homeBackoff, yPos, false, false); break;
+              case 4: drawEditLine(4, "SET Margin", tempCfg.margin, yPos, false, false); break;
+              case 5: drawEditLine(5, "Current", (float)tempCfg.motorCurrent, yPos, false, false, "%"); break;
+          }
+      }
+  }
+  else if (currentMenu == RESET_MENU) {
+    u8g2.drawStr(10, 20, "RESET LICZNIKA?");
+    u8g2.drawStr(15, 45, cursor == 0 ? "> NIE" : "  NIE");
+    u8g2.drawStr(15, 60, cursor == 1 ? "> TAK" : "  TAK");
+  }
+  else if (currentMenu == START_CONFIRM) {
+    u8g2.setFont(u8g2_font_7x14_tr);
+    u8g2.drawStr(10, 35, "KLIKNIJ CONFIRM");
+  }
+  else if (currentMenu == HOMING_SCREEN) {
+    u8g2.drawStr(15, 30, "BAZOWANIE...");
+    u8g2.drawStr(10, 45, "PROSZE CZEKAC");
+  }
+  else if (currentState == WAIT_FOR_RELOAD) {
+    u8g2.drawStr(20, 20, "!!! BRAK CZESCI !!!");
+    u8g2.drawStr(10, 40, "ZALADUJ MAGAZYNEK");
+    u8g2.drawStr(15, 55, "I KLIKNIJ CONFIRM");
+  }
+else if (currentMenu == CAL_JOG_MODE) {
+      // Jeśli minęło mniej niż 800ms od kliknięcia, pokaż wielki komunikat
+      if (currentAction == "ZERO SET" && (millis() - stateTimer < 2000)) {
+          u8g2.drawFrame(2, 10, 118, 45); // Ramka komunikatu
+          u8g2.setFont(u8g2_font_helvB12_tr);
+          u8g2.drawStr(4, 30, "POZYCJA 0.00");
+          u8g2.drawStr(8, 48, "USTAWIONA!");
+      } 
+      else {
+          // Normalny widok JOG (Twój poprzedni kod)
+          if (currentAction == "ZERO SET") currentAction = "JOG READY"; // Czyścimy flagę po czasie
+
+          u8g2.setFont(u8g2_font_6x12_tr);
+          u8g2.drawStr(0, 12, "RUCH RECZNY (JOG):");
+          u8g2.drawHLine(0, 15, 128);
+          
+          if (isHomed) {
+              u8g2.setFont(u8g2_font_helvB12_tr);
+              u8g2.setCursor(0, 35);
+              float posMm = (float)abs(currentTargetSteps) / STEPS_PER_MM;
+              u8g2.print("POS: "); u8g2.print(posMm, 2); u8g2.print(" mm");
+              u8g2.setFont(u8g2_font_6x12_tr);
+          } 
+          else {
+              u8g2.setFont(u8g2_font_helvB12_tr);
+              u8g2.setCursor(0, 35);
+              u8g2.print("PUSH TO SET 0");
+              u8g2.setFont(u8g2_font_6x12_tr);
+          } 
+          u8g2.setCursor(0, 50);
+          u8g2.print("BACK-wyjdz | SW-zero");
+          u8g2.setCursor(0, 62);
+          u8g2.print(currentAction); 
+      }
+  }
+
+  u8g2.sendBuffer();
+}
+
+void handleInputs() {
+  static unsigned long lastMoveTime = 0; 
+  long currEnc = encoder.getCount() / 2;
+  int diff = currEnc - lastEnc; 
+  
+  // 1. Obsługa Enkodera
+  if (diff != 0) {
+    unsigned long now = millis();
+    
+    // Filtr szumów: ignoruj impulsy pojawiające się szybciej niż 25ms
+    if (now - lastMoveTime < 10) {
+      // Nie aktualizujemy lastEnc, czekamy na stabilizację
+      return; 
+    }
+    lastMoveTime = now;
+
+if (currentMenu == CAL_JOG_MODE) {
+      // Sumujemy ruch, ale nie wysyłamy go natychmiast przy każdym impulsie
+      static long pendingSteps = 0;
+      static unsigned long lastJogXmit = 0;
+
+      pendingSteps += (diff * STEPS_PER_MM);
+      currentTargetSteps += (diff * STEPS_PER_MM); // Aktualizacja licznika na ekranie
+
+      // Wysyłaj komendę do silnika nie częściej niż co 50ms
+      if (abs(pendingSteps) >= 1 && millis() - lastJogXmit > 100) {
+        sendSmciCommand(MODE_REL); 
+        
+        if (pendingSteps > 0) {
+            sendSmciCommand("d0"); // PRAWO
+        } else {
+            sendSmciCommand("d1"); // LEWO
+        }
+        
+        sendSmciCommand("s" + String(abs(pendingSteps)));
+        sendSmciCommand("A");
+        
+        pendingSteps = 0; // Czyścimy zakumulowane kroki
+        lastJogXmit = millis();
+        currentAction = "JOGGING...";
+      }
+    }
+    else if (editing) {
+      if (currentMenu == PROG_MENU) {
+        if (cursor == 0) tempCfg.szerokosc = max(0.0f, tempCfg.szerokosc + (diff * 0.5f));
+        if (cursor == 1) tempCfg.odstep = max(0.0f, tempCfg.odstep + (diff * 0.5f));
+        if (cursor == 2) tempCfg.ilosc = constrain(tempCfg.ilosc + diff, 1, 100);
+      }
+      else if (currentMenu == SETTINGS_MENU) {
+        if (cursor == 0) { if(abs(diff)>0) tempCfg.autoMode = !tempCfg.autoMode; }
+        if (cursor == 1) tempCfg.workSpeed = constrain(tempCfg.workSpeed + (diff * 100), 100, 3000);
+        if (cursor == 2) tempCfg.homeSpeed = constrain(tempCfg.homeSpeed + (diff * 100), 100, 1500);
+        if (cursor == 3) tempCfg.homeBackoff = constrain(tempCfg.homeBackoff + (diff * 0.1f), 1.0f, 10.0f);
+        if (cursor == 4) tempCfg.margin = constrain(tempCfg.margin + (diff * 0.1f), 0.0f, 10.0f);
+        if (cursor == 5) tempCfg.motorCurrent = constrain(tempCfg.motorCurrent + (diff * 10), 10, 100);
+      }
+    }
+    else {
+      // Zwykłe przewijanie menu
+      cursor += diff;
+      int maxC = 0;
+      if (currentMenu == MAIN_MENU) maxC = 3;
+      else if (currentMenu == CALIBRATION_MENU) maxC = 2;
+      else if (currentMenu == PROG_MENU) maxC = 2;
+      else if (currentMenu == SETTINGS_MENU) maxC = 5;
+      else if (currentMenu == RESET_MENU) maxC = 1;
+
+      cursor = constrain(cursor, 0, maxC);
+    }
+    lastEnc = currEnc;
+  }
+
+  // 2. Obsługa Przycisku Enkodera (SW)
+  static bool swPressed = false;
+  if (digitalRead(ENCODER_SW) == LOW) {
+    if (!swPressed) { holdTimer = millis(); swPressed = true; }
+    if (currentMenu == STATUS_SCREEN && (millis() - holdTimer > ARM_START_DELAY)) arming = true;
+  } else {
+    if (swPressed) {
+      unsigned long duration = millis() - holdTimer;
+      if (currentMenu == STATUS_SCREEN) {
+        if (duration >= ARM_TOTAL_TIME) currentMenu = START_CONFIRM; 
+        else if (duration < ARM_START_DELAY) { currentMenu = MAIN_MENU; cursor = 0; tempCfg = cfg; }
+      } 
+      else if (currentMenu == MAIN_MENU) {
+        if (cursor == 0) currentMenu = PROG_MENU;
+        else if (cursor == 1) currentMenu = SETTINGS_MENU;
+        else if (cursor == 2) currentMenu = RESET_MENU;
+        else if (cursor == 3) currentMenu = CALIBRATION_MENU;
+        cursor = 0;
+      } 
+      else if (currentMenu == CALIBRATION_MENU) {
+        if (cursor == 0) { /* Test czujników */ }
+        else if (cursor == 1) { currentMenu = CAL_JOG_MODE; currentAction = "JOG READY"; }
+        else if (cursor == 2) { Serial.println("DIAGNOSTYKA SMCI"); }
+      }
+      else if (currentMenu == CAL_JOG_MODE) {
+          // 1. Logika zerowania
+          currentState = INIT_HOMING;
+          
+          // 2. Ustawiamy akcję i timer dla komunikatu
+          currentAction = "ZERO_OK"; // Specjalna flaga dla menu
+          stateTimer = millis();     // Wykorzystujemy istniejący timer
+          
+          Serial.println("[JOG] Baza ustawiona na 0.00");
+      }
+
+      else if (currentMenu == RESET_MENU) {
+        if (cursor == 1) { cfg.cycleCount = 0; saveToFlash(); }
+        currentMenu = MAIN_MENU; cursor = 2;
+      }
+      else if (currentMenu == WORKING_ANIM) { 
+        forceSafeState("ENKODER WCIŚNIĘTY");
+        currentState = IDLE;
+        swPressed = false;
+        arming = false;
+        return;
+      }
+      else if (currentMenu != START_CONFIRM) { 
+        editing = !editing; 
+      }
+      swPressed = false; arming = false;
+    }
+  }
+
+  // 3. Obsługa Przycisku CONFIRM
+  if (digitalRead(PIN_CONFIRM) == LOW) {
+    delay(200);
+    if (currentMenu == START_CONFIRM) {
+      currentMenu = WORKING_ANIM; 
+      startMachineProcess(); 
+    }
+    else if (currentState == WAIT_FOR_RELOAD) {
+      if (digitalRead(S_IR) == LOW) currentState = INIT_HOMING;
+    }
+    else if (currentMenu == PROG_MENU || currentMenu == SETTINGS_MENU) {
+      cfg = tempCfg; 
+      saveToFlash(); 
+      currentMenu = MAIN_MENU; 
+      cursor = 0; 
+      editing = false;
+    }
+  }
+
+  // 4. Obsługa Przycisku BACK
+  if (digitalRead(PIN_BACK) == LOW) {
+    delay(200);
+    if (currentState != IDLE) {
+      forceSafeState("BACK WCIŚNIĘTY");
+      currentState = IDLE;
+      motorFinished = true;
+      currentAction = "HALT: E-STOP";
+    } 
+    else {
+      if (editing) {
+        editing = false;
+      } else {
+        if (currentMenu == MAIN_MENU || currentMenu == START_CONFIRM || currentMenu == WORKING_ANIM) {
+          currentMenu = STATUS_SCREEN;
+        } else if (currentMenu == CALIBRATION_MENU) {
+          currentMenu = MAIN_MENU;
+          cursor = 3;
+        } 
+        else if (currentMenu == CAL_JOG_MODE) {
+          currentMenu = CALIBRATION_MENU;
+          cursor = 1;
+        } 
+        else {
+          currentMenu = MAIN_MENU;
+        }
+        tempCfg = cfg; 
+        cursor = 0;
+      }
+    }
+  }
+}
+
+// Koniec funkcji handleInputs
+void setupMotor() {
+  Serial.println("[SYSTEM] Konfiguracja sterownika Nanotec...");
+  
+  sendSmciCommand("S"); 
+  delay(100);
+  // Włączenie autostatusu 'j' (bardzo ważne!)
+  sendSmciCommand("J1"); 
+  delay(100);
+  
+  // Ustawienie prądu (i10 = 10% prądu znamionowego)
+  sendSmciCommand("i10");
+  sendSmciCommand("r0");
+  delay(100);
+
+  // Ustawienie rampy przyspieszania (b) i hamowania (B)
+  // Przykładowo b500 oznacza dość łagodny start
+  sendSmciCommand("b50000");
+  sendSmciCommand("B0");
+  delay(100);
+  
+  Serial.println("[SYSTEM] Sterownik gotowy.");
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(512); // WAŻNE - start EEPROM
+  
+  // RS485 i sterownik
+  Serial2.begin(115200, SERIAL_8N1, PIN_RS485_RX, PIN_RS485_TX);
+  pinMode(PIN_RS485_RE_DE, OUTPUT);
+  
+  setupMotor();
+
+  u8g2.begin();
+  encoder.attachHalfQuad(ENCODER_B, ENCODER_A); 
+  
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  pinMode(PIN_CONFIRM, INPUT_PULLUP);
+  pinMode(PIN_BACK, INPUT_PULLUP);
+  pinMode(PIN_S3_EXTEND, OUTPUT);
+  pinMode(S_DRILL, INPUT);
+  pinMode(S_IR, INPUT);
+  pinMode(PIN_HOME, INPUT_PULLUP);
+  
+  loadFromFlash();
+  tempCfg = cfg;
+}
+
+void loop() {
+  handleInputs();
+  render();
+  updateMachine();
+
+}
